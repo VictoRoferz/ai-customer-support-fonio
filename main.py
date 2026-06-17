@@ -14,6 +14,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
@@ -22,12 +24,22 @@ from conn_business_central import (
     BCConfigError,
     lookup_by_name,
     lookup_by_phone,
+    warmup,
 )
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("fonio-bc")
 
-app = FastAPI(title="Fonio ↔ Business Central")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Pre-warm the BC OAuth token so the first Fonio call doesn't pay the ~2.8 s
+    # handshake on the critical path (Fonio drops the webhook after 5000 ms).
+    log.info("warming BC auth: %s", "ok" if warmup() else "deferred (will retry on first call)")
+    yield
+
+
+app = FastAPI(title="Fonio ↔ Business Central", lifespan=lifespan)
 
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
 
