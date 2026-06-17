@@ -124,10 +124,19 @@ def warmup() -> bool:
     The OAuth handshake (~2.8 s) happens lazily on the first BC request and sits
     outside lookup_by_phone's time budget, so a first call could brush against
     Fonio's 5 s limit. Calling this at server startup moves that cost off the
-    critical path. Never raises — returns True if auth is now ready.
+    critical path: it caches the OAuth token and opens the pooled HTTPS
+    connection to BC with a trivial query. Never raises — returns True if BC is
+    reachable and auth is ready.
     """
     try:
-        _request_kwargs()  # triggers + caches the OAuth token in OAuth mode
+        kwargs = _request_kwargs()  # triggers + caches the OAuth token in OAuth mode
+        if BC_CONTACTS_URL:
+            _session.get(
+                BC_CONTACTS_URL,
+                params={"$top": "1", "$select": "no"},
+                timeout=REQUEST_TIMEOUT,
+                **kwargs,
+            )
         return True
     except Exception:
         return False
