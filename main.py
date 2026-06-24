@@ -26,6 +26,12 @@ from conn_business_central import (
     lookup_by_phone,
     warmup,
 )
+from conn_zammad import (
+    ZammadConfigError,
+    ZammadError,
+    create_call_ticket,
+)
+from conn_zammad import warmup as zammad_warmup
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("fonio-bc")
@@ -36,6 +42,7 @@ async def lifespan(app: FastAPI):
     # Pre-warm the BC OAuth token so the first Fonio call doesn't pay the ~2.8 s
     # handshake on the critical path (Fonio drops the webhook after 5000 ms).
     log.info("warming BC auth: %s", "ok" if warmup() else "deferred (will retry on first call)")
+    log.info("warming Zammad: %s", "ok" if zammad_warmup() else "deferred/unconfigured")
     yield
 
 
@@ -68,6 +75,26 @@ class ContactOut(BaseModel):
     birth_date: str | None = None
     contact_no: str | None = None
     candidates: list[dict] | None = None
+
+
+class CallLogIn(BaseModel):
+    """Fonio post-processing (after-call) payload → one Zammad ticket."""
+
+    phone_number: str | None = Field(default=None, description="Caller's number")
+    name: str | None = Field(default=None, description="Caller/contact name, if known")
+    customer: str | None = Field(
+        default=None, description="Customer email; Zammad finds or auto-creates the user"
+    )
+    summary: str | None = Field(default=None, description="Call summary / transcript")
+    contact_no: str | None = Field(default=None, description="BC contact no. (KN-number), if matched")
+    bc_found: bool | None = Field(default=None, description="Whether BC identified the caller")
+    title: str | None = Field(default=None, description="Override the ticket title")
+
+
+class CallLogOut(BaseModel):
+    created: bool
+    ticket_id: int | None = None
+    ticket_number: str | None = None
 
 
 @app.get("/health")
@@ -134,3 +161,37 @@ def lookup_name(
         )
 
     return ContactOut(found=True, candidates=matches)
+
+
+@app.post("/log-call", response_model=CallLogOut)
+def log_call(
+    body: CallLogIn,
+    authorization: str | None = Header(default=None),
+) -> CallLogOut:
+    """Create a Zammad ticket logging a finished call.
+
+    Wired to Fonio's post-processing / Outbound API (Nachverarbeitung), so it
+    runs after the call — no 5000 ms budget. Not on the live-call critical path.
+    """
+    _check_auth(authorization)
+    try:
+        ticket = create_call_ticket(
+            phone_number=body.phone_number,
+            name=body.name,
+            customer=body.customer,
+            summary=body.summary,
+            contact_no=body.contact_no,
+            bc_found=body.bc_found,
+            title=body.title,
+        )
+    except ZammadConfigError as e:
+        raise HTTPException(status_code=500, detail=f"zammad config: {e}") from e
+    except ZammadError as e:
+        log.exception("create_call_ticket failed")
+        raise HTTPException(status_code=502, detail=f"zammad: {e}") from e
+
+    return CallLogOut(
+        created=True,
+        ticket_id=ticket.get("id") if ticket else None,
+        ticket_number=ticket.get("number") if ticket else None,
+    )
