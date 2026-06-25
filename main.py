@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 from conn_business_central import (
     BCAuthError,
     BCConfigError,
+    check_order_eligibility,
     lookup_by_name,
     lookup_by_phone,
     warmup,
@@ -77,6 +78,29 @@ class ContactOut(BaseModel):
     candidates: list[dict] | None = None
 
 
+class CallerOut(BaseModel):
+    """Response for /lookup-caller. Top-level keys are bound 1:1 to the Fonio
+    prompt's {{system variables}} — DO NOT rename without updating the prompt.
+
+    Maps to prompt section 5: customer_found, name, customer_number,
+    date_of_birth, phone_number, permission_to_order_again, last_ordered_items.
+    Extra keys (contact_no, health_insurance_no) are for internal use / the
+    Zammad protocol and are ignored by the prompt.
+    """
+
+    customer_found: bool
+    name: str | None = None
+    customer_number: str | None = None          # BC customerNo (for orders)
+    date_of_birth: str | None = None
+    phone_number: str | None = None             # echoed input
+    permission_to_order_again: bool | None = None
+    last_ordered_items: str = ""
+    # internal / protocol only:
+    contact_no: str | None = None               # BC KN-number (Zammad linkage)
+    health_insurance_no: str | None = None      # reported, not a decision
+    last_order_date: str | None = None
+
+
 class CallLogIn(BaseModel):
     """Fonio post-processing (after-call) payload → one Zammad ticket."""
 
@@ -102,11 +126,15 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/lookup-caller", response_model=ContactOut)
+@app.post("/lookup-caller", response_model=CallerOut)
 def lookup_caller(
     body: PhoneLookupIn,
     authorization: str | None = Header(default=None),
-) -> ContactOut:
+) -> CallerOut:
+    """On call ring: identify the caller by phone in BC and, if matched, compute
+    spare-part order eligibility (3-month recency rule). Returns all the prompt's
+    system variables in one response. The agent still verifies identity (name +
+    date_of_birth) against these values before disclosing anything."""
     _check_auth(authorization)
     try:
         contact = lookup_by_phone(body.phone_number)
@@ -119,14 +147,23 @@ def lookup_caller(
         raise HTTPException(status_code=502, detail=str(e)) from e
 
     if not contact:
-        return ContactOut(found=False)
-    return ContactOut(
-        found=True,
+        return CallerOut(customer_found=False, phone_number=body.phone_number)
+
+    # Eligibility is best-effort (never raises) so a slow/failed sales query
+    # degrades to permission=None rather than dropping the call.
+    elig = check_order_eligibility(contact.get("customer_no") or "")
+
+    return CallerOut(
+        customer_found=True,
         name=contact["name"],
-        first_name=contact["first_name"],
-        surname=contact["surname"],
-        birth_date=contact["birth_date"],
+        customer_number=contact.get("customer_no"),
+        date_of_birth=contact["birth_date"],
+        phone_number=body.phone_number,
+        permission_to_order_again=elig["permission_to_order_again"],
+        last_ordered_items=elig["last_ordered_items"],
         contact_no=contact["no"],
+        health_insurance_no=contact.get("health_insurance_no"),
+        last_order_date=elig["last_order_date"],
     )
 
 

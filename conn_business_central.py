@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 import re
 import time
+from datetime import date, timedelta
 from typing import Any
 
 import requests
@@ -45,6 +46,17 @@ PHONE_FIELDS = [
 ]
 
 DEFAULT_COUNTRY_CODE = os.environ.get("BC_DEFAULT_COUNTRY_CODE", "49")
+
+# "Ordered recently?" window for spare-part eligibility. 3 months ≈ 90 days.
+ORDER_WINDOW_DAYS = int(os.environ.get("BC_ORDER_WINDOW_DAYS", "90"))
+
+# Sales document entities that count as "an order", with their date field.
+# Linkage: Contact.customerNo -> sellToCustomerNo on each header (see CLAUDE.md).
+SALES_DOC_ENTITIES = {
+    "SalesInvHeader": "postingDate",   # posted invoices
+    "SalesShipHeader": "postingDate",  # shipments
+    "SalesHeader": "orderDate",        # open orders
+}
 
 _token_cache: dict[str, Any] = {"access_token": None, "expires_at": 0.0}
 
@@ -168,6 +180,8 @@ def _select_fields() -> str:
             "surname",
             "birthDate",
             "eMail",
+            "customerNo",         # -> sales/repair documents (order history)
+            "healthInsuranceNo",  # Krankenkasse identifier (reported, not a decision)
             *PHONE_FIELDS,
         ]
     )
@@ -188,6 +202,17 @@ def _odata_get(filter_expr: str, top: int = 5) -> list[dict[str, Any]]:
     return resp.json().get("value", [])
 
 
+def _clean_birth_date(value: Any) -> str | None:
+    """BC stores an empty birth date as the min-date 0001-01-01 (and some
+    company contacts have no real DOB). Treat those as None so the agent never
+    reads a bogus date aloud during identity verification."""
+    if not value:
+        return None
+    if str(value).startswith("0001-01-01"):
+        return None
+    return value
+
+
 def _shape(contact: dict[str, Any]) -> dict[str, Any]:
     first = contact.get("firstName") or ""
     surname = contact.get("surname") or ""
@@ -197,8 +222,10 @@ def _shape(contact: dict[str, Any]) -> dict[str, Any]:
         "name": display,
         "first_name": first or None,
         "surname": surname or None,
-        "birth_date": contact.get("birthDate"),
+        "birth_date": _clean_birth_date(contact.get("birthDate")),
         "email": contact.get("eMail"),
+        "customer_no": contact.get("customerNo") or None,
+        "health_insurance_no": contact.get("healthInsuranceNo") or None,
     }
 
 
@@ -248,3 +275,109 @@ def lookup_by_name(name: str, limit: int = 5) -> list[dict[str, Any]]:
         return [_shape(r) for r in rows]
 
     return []
+
+
+# --- Spare-part / order eligibility -----------------------------------------
+# Linkage runs off Contact.customerNo (NOT the KN-number). See CLAUDE.md.
+
+def _entity_url(entity: str) -> str:
+    """Sibling entity set under the same Company('…') OData root as Contact."""
+    base = BC_CONTACTS_URL.rsplit("/Contact", 1)[0]
+    return f"{base}/{entity}"
+
+
+def _odata_get_entity(
+    entity: str,
+    filter_expr: str,
+    select: str,
+    top: int = 5,
+    orderby: str | None = None,
+) -> list[dict[str, Any]]:
+    params: dict[str, str] = {
+        "$filter": filter_expr,
+        "$select": select,
+        "$top": str(top),
+    }
+    if orderby:
+        params["$orderby"] = orderby
+    resp = requests.get(_entity_url(entity), params=params, timeout=20, **_request_kwargs())
+    if resp.status_code == 401:
+        raise BCAuthError(f"BC rejected auth: {resp.text}")
+    resp.raise_for_status()
+    return resp.json().get("value", [])
+
+
+def _has_recent_order(customer_no: str, cutoff: str) -> bool:
+    """True if the customer has any sales document on/after `cutoff` (ISO date)."""
+    for entity, date_field in SALES_DOC_ENTITIES.items():
+        filt = f"sellToCustomerNo eq '{_escape(customer_no)}' and {date_field} ge {cutoff}"
+        rows = _odata_get_entity(entity, filt, select=f"no,{date_field}", top=1)
+        if rows:
+            return True
+    return False
+
+
+def _last_invoice_items(customer_no: str) -> tuple[list[str], str | None]:
+    """Most recent posted invoice's line descriptions + its posting date."""
+    heads = _odata_get_entity(
+        "SalesInvHeader",
+        f"sellToCustomerNo eq '{_escape(customer_no)}'",
+        select="no,postingDate",
+        top=1,
+        orderby="postingDate desc",
+    )
+    if not heads:
+        return [], None
+    doc_no = heads[0].get("no")
+    posting_date = heads[0].get("postingDate")
+    lines = _odata_get_entity(
+        "SalesInvLine",
+        f"documentNo eq '{_escape(doc_no)}'",
+        select="documentNo,type,no,description,quantity",
+        top=20,
+    )
+    items = [
+        (ln.get("description") or ln.get("no") or "").strip()
+        for ln in lines
+        if (ln.get("description") or ln.get("no"))
+    ]
+    return [i for i in items if i], posting_date
+
+
+def check_order_eligibility(
+    customer_no: str, window_days: int = ORDER_WINDOW_DAYS
+) -> dict[str, Any]:
+    """Decide whether a customer may order a spare part again.
+
+    RULE (current): 3-month *recency only* — eligible iff no sales document
+    (invoice / shipment / open order) exists within `window_days`. The
+    Krankenkasse is NOT decided here: BC stores only the insurance number, so
+    that half is reported elsewhere and a human makes the coverage call.
+
+    Best-effort: any BC error degrades to permission=None ("unknown") rather
+    than raising, so the on-ring lookup never fails the whole call over this.
+    Returns: {permission_to_order_again, last_ordered_items, last_order_date}.
+    """
+    result: dict[str, Any] = {
+        "permission_to_order_again": None,
+        "last_ordered_items": "",
+        "last_order_date": None,
+    }
+    if not customer_no:
+        return result
+
+    cutoff = (date.today() - timedelta(days=window_days)).isoformat()
+    try:
+        recent = _has_recent_order(customer_no, cutoff)
+        result["permission_to_order_again"] = not recent
+    except (requests.RequestException, BCAuthError):
+        pass  # leave permission as None -> agent treats as "unknown"
+
+    try:
+        items, last_date = _last_invoice_items(customer_no)
+        result["last_ordered_items"] = ", ".join(items)
+        result["last_order_date"] = last_date
+    except (requests.RequestException, BCAuthError):
+        pass
+
+    return result
