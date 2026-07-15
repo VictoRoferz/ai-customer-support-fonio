@@ -98,6 +98,133 @@ def find_user(phone: str | None = None, email: str | None = None) -> dict[str, A
     return None
 
 
+_me_cache: dict[str, Any] = {}
+
+
+def _token_user_id() -> int | None:
+    """Id of the API token's own user (cached). Best-effort: None on failure."""
+    if "id" not in _me_cache:
+        try:
+            me = _request("GET", "users/me")
+            _me_cache["id"] = (me or {}).get("id")
+        except ZammadError:
+            return None
+    return _me_cache.get("id")
+
+
+def _resolve_customer(
+    payload: dict[str, Any], *, customer: str | None, phone_number: str | None
+) -> None:
+    """Attach a customer to a ticket payload (Zammad hard-requires one).
+
+    1. Explicit `customer` email -> pass through (Zammad finds/auto-creates).
+    2. Else search existing users by phone -> use their id.
+    3. Else file under the service account's own user. Zammad's "guess:"
+       syntax only accepts EMAILS — "guess:<phone>" 422s (verified live
+       2026-07-13), and omitting the customer 422s too. The real caller
+       number stays in the ticket body, and no PII user record is created.
+    """
+    if customer:
+        payload["customer"] = customer
+        return
+    user = find_user(phone=phone_number)
+    if user and user.get("id"):
+        payload["customer_id"] = user["id"]
+        return
+    me_id = _token_user_id()
+    if me_id:
+        payload["customer_id"] = me_id
+    # else: leave unset and let Zammad's 422 surface — nothing sane to attach.
+
+
+def create_ticket(
+    *,
+    title: str,
+    body: str,
+    customer: str | None = None,
+    phone_number: str | None = None,
+    priority_id: int | None = None,
+    tags: str | None = None,
+    article_type: str = "note",
+    internal: bool = False,
+) -> dict[str, Any]:
+    """Create one Zammad ticket with an arbitrary title/body. Returns the raw
+    ticket JSON (callers read `id` and `number` — the ticket number doubles as
+    the request number read to the caller, per prompt §11.4).
+
+    `priority_id` maps to Zammad's ticket_priorities (default install:
+    1 low / 2 normal / 3 high) — used for VIGILANCE / URGENT_MEDICAL.
+    `tags` is a comma-separated string; best-effort (older Zammad versions
+    ignore it on create — the [TYPE] title prefix is the durable encoding).
+    """
+    _require_config()
+    payload: dict[str, Any] = {
+        "title": title,
+        "group": ZAMMAD_GROUP,
+        "article": {
+            "subject": title,
+            "body": body,
+            "type": article_type,
+            "internal": internal,
+        },
+    }
+    if priority_id is not None:
+        payload["priority_id"] = priority_id
+    if tags:
+        payload["tags"] = tags
+    _resolve_customer(payload, customer=customer, phone_number=phone_number)
+    return _request("POST", "tickets", json=payload)
+
+
+# Ticket states that count as "still open" for duplicate detection.
+# NB: the two-word state MUST be quoted — an unquoted space breaks the whole
+# Lucene query (0 hits for everything; found the hard way, 2026-07-13).
+_OPEN_STATES = '(new OR open OR "pending reminder")'
+
+
+def search_open_tickets(
+    *,
+    phone_number: str | None = None,
+    contact_no: str | None = None,
+    title_contains: str | None = None,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    """Find open tickets for a caller, for duplicate-request prevention (§11.2).
+
+    Strategy: resolve the caller to a Zammad user by phone and query their open
+    tickets; else fall back to a full-text phrase search on the KN-number
+    (every ticket we create carries it in title/body). `title_contains` is
+    applied client-side — don't bet on Lucene tokenizing "[SPARE_PARTS]".
+
+    Returns [] when nothing matches; raises ZammadError only on transport/auth
+    problems (callers decide how to degrade).
+    """
+    query = None
+    user = find_user(phone=phone_number) if phone_number else None
+    if user and user.get("id"):
+        query = f"state.name:{_OPEN_STATES} AND customer_id:{user['id']}"
+    elif contact_no:
+        query = f'state.name:{_OPEN_STATES} AND "{contact_no}"'
+    if not query:
+        return []
+
+    results = _request(
+        "GET", "tickets/search", params={"query": query, "limit": limit, "expand": "true"}
+    )
+    # Normalize the two response shapes: expanded list vs {tickets, assets}.
+    if isinstance(results, dict):
+        assets = (results.get("assets") or {}).get("Ticket") or {}
+        tickets = [assets[str(tid)] for tid in results.get("tickets") or [] if str(tid) in assets]
+    elif isinstance(results, list):
+        tickets = results
+    else:
+        tickets = []
+
+    if title_contains:
+        tickets = [t for t in tickets if title_contains in (t.get("title") or "")]
+    return tickets
+
+
 def _build_body(
     *,
     phone_number: str | None,
@@ -142,9 +269,8 @@ def create_call_ticket(
       1. If `customer` (an email) is given, pass it through — Zammad finds or
          auto-creates that user.
       2. Else search existing users by phone; if found, use their id.
-      3. Else fall back to Zammad's "guest" customer ("guess:<phone>" syntax),
-         which lets Zammad attach a placeholder customer when we only have a
-         phone number — no PII user record is force-created.
+      3. Else file under the service account's user (see _resolve_customer —
+         "guess:<phone>" does NOT work, the syntax only accepts emails).
 
     `title` defaults to a caller-derived subject. `article_type` is "phone" so
     it shows as a call in Zammad's timeline; use "note" for plain logs.
@@ -168,18 +294,7 @@ def create_call_ticket(
         },
     }
 
-    if customer:
-        payload["customer"] = customer
-    else:
-        user = find_user(phone=phone_number)
-        if user and user.get("id"):
-            payload["customer_id"] = user["id"]
-        elif phone_number:
-            # Zammad accepts a "guess:<value>" customer to attach a placeholder
-            # without us having to create/curate a user record up front.
-            payload["customer"] = f"guess:{phone_number}"
-        # else: no customer info at all -> let Zammad default to the token's user
-
+    _resolve_customer(payload, customer=customer, phone_number=phone_number)
     return _request("POST", "tickets", json=payload)
 
 

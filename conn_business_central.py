@@ -47,6 +47,12 @@ PHONE_FIELDS = [
 
 DEFAULT_COUNTRY_CODE = os.environ.get("BC_DEFAULT_COUNTRY_CODE", "49")
 
+# Contact field holding the postal code (verification factor). Confirmed live on
+# DE-TEST: `postCode` (top-level, populated; the privat* block is empty there).
+# Empty value disables the field entirely — important because a wrong name here
+# would 400 EVERY lookup (there is no bad-field recovery in _odata_get).
+BC_POSTAL_FIELD = os.environ.get("BC_POSTAL_FIELD", "postCode").strip()
+
 # "Ordered recently?" window for spare-part eligibility. 3 months ≈ 90 days.
 ORDER_WINDOW_DAYS = int(os.environ.get("BC_ORDER_WINDOW_DAYS", "90"))
 
@@ -55,7 +61,7 @@ ORDER_WINDOW_DAYS = int(os.environ.get("BC_ORDER_WINDOW_DAYS", "90"))
 SALES_DOC_ENTITIES = {
     "SalesInvHeader": "postingDate",   # posted invoices
     "SalesShipHeader": "postingDate",  # shipments
-    "SalesHeader": "orderDate",        # open orders
+    "SalesHeader": "orderDate",        # open orders (not yet posted orders)
 }
 
 _token_cache: dict[str, Any] = {"access_token": None, "expires_at": 0.0}
@@ -162,6 +168,13 @@ def phone_variants(raw: str) -> list[str]:
     if raw_trim:
         variants.add(raw_trim)
 
+    # International twins for foreign callers (e.g. Austria): +43... and
+    # 0043... denote the same number; BC may store either form.
+    if digits.startswith("00"):
+        variants.add("+" + digits[2:])
+    if raw_trim.startswith("+"):
+        variants.add("00" + digits)
+
     return sorted(variants)
 
 
@@ -182,6 +195,7 @@ def _select_fields() -> str:
             "eMail",
             "customerNo",         # -> sales/repair documents (order history)
             "healthInsuranceNo",  # Krankenkasse identifier (reported, not a decision)
+            *([BC_POSTAL_FIELD] if BC_POSTAL_FIELD else []),
             *PHONE_FIELDS,
         ]
     )
@@ -226,6 +240,10 @@ def _shape(contact: dict[str, Any]) -> dict[str, Any]:
         "email": contact.get("eMail"),
         "customer_no": contact.get("customerNo") or None,
         "health_insurance_no": contact.get("healthInsuranceNo") or None,
+        "postal_code": (contact.get(BC_POSTAL_FIELD) or None) if BC_POSTAL_FIELD else None,
+        # All stored numbers, for identity verification (phone factor) without
+        # a second BC round-trip — the fields are already in the $select.
+        "phones": [contact.get(f) for f in PHONE_FIELDS if contact.get(f)],
     }
 
 
@@ -252,29 +270,137 @@ def lookup_by_phone(phone: str) -> dict[str, Any] | None:
     return None
 
 
+def _name_variants(name: str) -> list[str]:
+    """German spelling variants for STT robustness: ß↔ss↔s, ä↔ae, ö↔oe, ü↔ue.
+
+    A caller saying "Haußmann" may be transcribed "Haussmann" OR "Hausmann"
+    (ß sounds like a plain s); contains() is exact, so we probe the alternates
+    too. Some generated forms are nonsense ("ßtraße") — harmless, they just
+    return no rows. Returns only variants that differ from the input."""
+    to_ascii = (
+        name.replace("ß", "ss")
+        .replace("ä", "ae").replace("ö", "oe").replace("ü", "ue")
+        .replace("Ä", "Ae").replace("Ö", "Oe").replace("Ü", "Ue")
+    )
+    to_ascii_single = name.replace("ß", "s")
+    to_special = (
+        name.replace("ss", "ß")
+        .replace("ae", "ä").replace("oe", "ö").replace("ue", "ü")
+        .replace("Ae", "Ä").replace("Oe", "Ö").replace("Ue", "Ü")
+    )
+    # single s -> ß (after ss -> ß so "Haussmann" doesn't become "Haußßmann")
+    to_special_single = name.replace("ss", "ß").replace("s", "ß")
+    out = []
+    for v in (to_ascii, to_ascii_single, to_special, to_special_single):
+        if v != name and v not in out:
+            out.append(v)
+    return out
+
+
+def _name_probes(cleaned: str) -> list[str]:
+    """Probe ladder for a spoken name: full string + spelling variants, then
+    the last token (surname) + its variants. Deduplicated, order preserved."""
+    probes = [cleaned, *_name_variants(cleaned)]
+    tokens = [t for t in re.split(r"\s+", cleaned) if t]
+    if len(tokens) >= 2:
+        probes += [tokens[-1], *_name_variants(tokens[-1])]
+    seen: set[str] = set()
+    out = []
+    for p in probes:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
 def lookup_by_name(name: str, limit: int = 5) -> list[dict[str, Any]]:
     """Find contacts by name using contains() on the `name` field.
 
     contains() is supported on a single field; only OR across distinct fields
-    fails. If the full string returns nothing, retry with the last token alone
-    (handles cases like "Max Mustermann" where only "Mustermann" is stored).
+    fails. Retry ladder: full string -> German spelling variants (ß/ss,
+    umlauts; STT robustness) -> last token alone (handles "Max Mustermann"
+    where only "Mustermann" is stored) -> last-token variants.
     """
     cleaned = (name or "").strip()
     if not cleaned:
         return []
 
-    filt = f"contains(name, '{_escape(cleaned)}')"
-    rows = _odata_get(filt, top=limit)
-    if rows:
-        return [_shape(r) for r in rows]
-
-    tokens = [t for t in re.split(r"\s+", cleaned) if t]
-    if len(tokens) >= 2:
-        filt = f"contains(name, '{_escape(tokens[-1])}')"
-        rows = _odata_get(filt, top=limit)
-        return [_shape(r) for r in rows]
-
+    for probe in _name_probes(cleaned):
+        rows = _odata_get(f"contains(name, '{_escape(probe)}')", top=limit)
+        if rows:
+            return [_shape(r) for r in rows]
     return []
+
+
+def lookup_by_name_all(name: str, limit: int = 10) -> list[dict[str, Any]]:
+    """Union of matches across ALL spelling probes (no first-hit shortcut).
+
+    lookup_by_name stops at the first probe with rows — fine for candidate
+    lists, but fatal for verification when a literal spelling ("Hausmann")
+    matches real contacts while the caller is the ß-spelled one ("Haußmann"):
+    the right record is never fetched. This variant merges every probe's rows,
+    deduped by KN-number, so the factor check sees all plausible spellings.
+    Costs up to ~8 sequential queries — use only when the first pass failed."""
+    cleaned = (name or "").strip()
+    if not cleaned:
+        return []
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for probe in _name_probes(cleaned):
+        for row in _odata_get(f"contains(name, '{_escape(probe)}')", top=limit):
+            shaped = _shape(row)
+            if shaped["no"] not in seen:
+                seen.add(shaped["no"])
+                out.append(shaped)
+        if len(out) >= limit * 3:  # safety cap
+            break
+    return out
+
+
+def get_contact_by_no(contact_no: str) -> dict[str, Any] | None:
+    """Fetch one contact by its KN-number (the `no` field). Exact eq filter.
+
+    Used by /create-request to re-verify the caller's identity factors against
+    BC before creating an order ticket (zero-trust toward the voice agent)."""
+    cleaned = (contact_no or "").strip()
+    if not cleaned:
+        return None
+    rows = _odata_get(f"no eq '{_escape(cleaned)}'", top=1)
+    return _shape(rows[0]) if rows else None
+
+
+def _to_national_digits(raw: str) -> str:
+    """Reduce a phone number to its national-significant digits.
+
+    Strips separators, then the international/trunk prefixes (`00<cc>`, `<cc>`,
+    `0`), so '+49 172 893-4185', '0172 8934185' and '491728934185' all compare
+    equal. `<cc>` is only stripped when the raw form isn't trunk-prefixed
+    (mirrors phone_variants' handling of e.g. '0491...' Aachen-style numbers).
+    """
+    digits = _digits_only(raw)
+    cc = DEFAULT_COUNTRY_CODE
+    if digits.startswith("00" + cc):
+        return digits[2 + len(cc):]
+    if digits.startswith("00"):
+        # Foreign 00-prefixed number (e.g. 0043... for Austria): strip only the
+        # international prefix so it compares equal to its +43... twin. The
+        # foreign country code stays in — cross-country numbers must not
+        # collide with German nationals.
+        return digits[2:]
+    if digits.startswith(cc) and not (raw or "").lstrip().startswith("0"):
+        return digits[len(cc):]
+    if digits.startswith("0"):
+        return digits[1:]
+    return digits
+
+
+def phone_matches(a: str, b: str) -> bool:
+    """True when two phone strings denote the same national number.
+
+    Both sides reduced via _to_national_digits; short strings (<6 digits) never
+    match so fragments/extensions can't produce false positives."""
+    na, nb = _to_national_digits(a or ""), _to_national_digits(b or "")
+    return len(na) >= 6 and na == nb
 
 
 # --- Spare-part / order eligibility -----------------------------------------
@@ -342,6 +468,22 @@ def _last_invoice_items(customer_no: str) -> tuple[list[str], str | None]:
         if (ln.get("description") or ln.get("no"))
     ]
     return [i for i in items if i], posting_date
+
+
+def has_recent_order(
+    customer_no: str, window_days: int = ORDER_WINDOW_DAYS
+) -> bool | None:
+    """Recency check only (no invoice-line queries) for /create-request.
+
+    Best-effort like check_order_eligibility: returns True/False, or None when
+    BC errored / customer_no is empty — the caller decides how to degrade."""
+    if not customer_no:
+        return None
+    cutoff = (date.today() - timedelta(days=window_days)).isoformat()
+    try:
+        return _has_recent_order(customer_no, cutoff)
+    except (requests.RequestException, BCAuthError):
+        return None
 
 
 def check_order_eligibility(
