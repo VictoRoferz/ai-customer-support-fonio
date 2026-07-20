@@ -163,7 +163,8 @@ class CreateRequestIn(_TemplateTolerantModel):
     # Optional: browser test calls and suppressed caller IDs carry no number;
     # verification and Zammad customer resolution both degrade gracefully.
     phone_number: str | None = Field(default=None, description="Caller's number ({{fromNumber}})")
-    contact_no: str | None = Field(default=None, description="BC KN-number from /lookup-caller")
+    name: str | None = Field(default=None, description="Caller-SPOKEN full name (identity resolution)")
+    contact_no: str | None = Field(default=None, description="BC KN-number from /lookup-caller or verify_caller")
     customer_number: str | None = Field(default=None, description="Verification factor")
     date_of_birth: str | None = Field(default=None, description="Caller-SPOKEN birth date, any format")
     postal_code: str | None = Field(default=None, description="Verification factor")
@@ -328,6 +329,82 @@ _VERIFY_FAIL_MSG = (
 )
 
 
+def _resolve_and_verify(
+    *,
+    name: str | None,
+    contact_no: str | None,
+    date_of_birth: str | None,
+    phone_number: str | None,
+    customer_number: str | None,
+    postal_code: str | None,
+) -> tuple[dict | None, list[str]]:
+    """Locate exactly ONE BC contact that passes the §10.1 factor rules.
+
+    Shared by /verify-caller and /create-request so ordering never depends on
+    the LLM correctly copying a KN-number between tool calls — the spoken name
+    plus factors are always sufficient.
+
+    Candidate sources: the spoken name (fast ladder, then widened spelling
+    union) and/or the KN-number (ring lookup / previous verification).
+    Name-selected candidates need >=1 matching factor incl. DOB when on file
+    (the name itself is the implicit first factor); the KN-selected contact
+    gets NO name credit and needs the full >=2-factors-incl-DOB rule.
+    Exactly one survivor may remain: zero or several -> (None, []) — the
+    caller-facing response must be identical either way (§10.1).
+    BC transport/auth errors propagate — callers map them to HTTP codes.
+    """
+    def evaluate(pool: list[dict]) -> list[tuple[dict, list[str]]]:
+        found = []
+        for c in pool:
+            _, matched = match_identity_factors(
+                c,
+                date_of_birth=date_of_birth,
+                phone_number=phone_number,
+                customer_number=customer_number,
+                postal_code=postal_code,
+                phone_matches=phone_matches,
+            )
+            if matched and ("dob" in matched or not c.get("birth_date")):
+                found.append((c, matched))
+        return found
+
+    candidates = lookup_by_name(name, limit=10) if name else []
+    survivors = evaluate(candidates)
+    evaluated_nos = {c.get("no") for c in candidates}
+
+    if name and not survivors:
+        # Widened second pass: the fast ladder stops at the first spelling with
+        # rows, which loses e.g. "Haußmann" when STT wrote "Hausmann" and
+        # literal Hausmanns exist. Merge ALL spelling variants and re-check.
+        try:
+            widened = [c for c in lookup_by_name_all(name, limit=10)
+                       if c.get("no") not in evaluated_nos]
+        except Exception:
+            log.exception("widened name search failed; keeping first-pass result")
+            widened = []
+        survivors = evaluate(widened)
+
+    ring_contact = get_contact_by_no(contact_no) if contact_no else None
+    if ring_contact and ring_contact.get("no") not in {c.get("no") for c, _ in survivors}:
+        ring_verified, matched = match_identity_factors(
+            ring_contact,
+            date_of_birth=date_of_birth,
+            phone_number=phone_number,
+            customer_number=customer_number,
+            postal_code=postal_code,
+            phone_matches=phone_matches,
+        )
+        if ring_verified:  # full rule: >=2 factors, DOB gated
+            survivors.append((ring_contact, matched))
+
+    # Factor NAMES only — never values (PII).
+    log.info("identity resolve: name=%s kn=%s survivors=%d factors=%s",
+             bool(name), bool(contact_no), len(survivors), [m for _, m in survivors])
+    if len(survivors) != 1:
+        return None, []  # none matched, or ambiguous — identical outcome (§10.1)
+    return survivors[0]
+
+
 @app.post("/verify-caller", response_model=VerifyOut)
 def verify_caller(
     body: VerifyIn,
@@ -350,11 +427,14 @@ def verify_caller(
         return fail
 
     try:
-        candidates = lookup_by_name(body.name, limit=10)
-        # The ring-matched contact joins the candidate pool (STT robustness:
-        # "Haußmann" transcribed oddly must not fail the real patient). It gets
-        # NO name credit — the stricter >=2-factors-incl-DOB rule applies.
-        ring_contact = get_contact_by_no(body.contact_no) if body.contact_no else None
+        contact, _ = _resolve_and_verify(
+            name=body.name,
+            contact_no=body.contact_no,
+            date_of_birth=body.date_of_birth,
+            phone_number=body.phone_number,
+            customer_number=body.customer_number,
+            postal_code=body.postal_code,
+        )
     except BCConfigError as e:
         raise HTTPException(status_code=500, detail=f"config: {e}") from e
     except BCAuthError as e:
@@ -363,59 +443,8 @@ def verify_caller(
         log.exception("verify-caller BC lookup failed")
         raise HTTPException(status_code=502, detail=str(e)) from e
 
-    def _evaluate(pool: list[dict]) -> list[tuple[dict, list[str]]]:
-        found = []
-        for c in pool:
-            _, matched = match_identity_factors(
-                c,
-                date_of_birth=body.date_of_birth,
-                phone_number=body.phone_number,
-                customer_number=body.customer_number,
-                postal_code=body.postal_code,
-                phone_matches=phone_matches,
-            )
-            # Name is the implicit first factor; require >=1 more, and the DOB
-            # must be among them whenever BC has a birth date on file.
-            if matched and ("dob" in matched or not c.get("birth_date")):
-                found.append((c, matched))
-        return found
-
-    survivors = _evaluate(candidates)
-    evaluated_nos = {c.get("no") for c in candidates}
-
-    if not survivors:
-        # Widened second pass: the fast ladder stops at the first spelling with
-        # rows, which loses e.g. "Haußmann" when STT wrote "Hausmann" and
-        # literal Hausmanns exist. Merge ALL spelling variants and re-check.
-        try:
-            widened = [c for c in lookup_by_name_all(body.name, limit=10)
-                       if c.get("no") not in evaluated_nos]
-        except Exception:
-            log.exception("widened name search failed; keeping first-pass result")
-            widened = []
-        survivors = _evaluate(widened)
-        evaluated_nos |= {c.get("no") for c in widened}
-
-    seen_nos = {c.get("no") for c, _ in survivors}
-    if ring_contact and ring_contact.get("no") not in seen_nos:
-        ring_verified, matched = match_identity_factors(
-            ring_contact,
-            date_of_birth=body.date_of_birth,
-            phone_number=body.phone_number,
-            customer_number=body.customer_number,
-            postal_code=body.postal_code,
-            phone_matches=phone_matches,
-        )
-        if ring_verified:  # full rule: >=2 factors, DOB gated
-            survivors.append((ring_contact, matched))
-
-    # Factor NAMES only — never values (PII).
-    log.info("verify-caller: candidates=%d survivors=%d factors=%s",
-             len(candidates), len(survivors), [m for _, m in survivors])
-    if len(survivors) != 1:
+    if not contact:
         return fail  # none matched, or ambiguous — identical response either way
-
-    contact, _ = survivors[0]
     elig = check_order_eligibility(contact.get("customer_no") or "")
     return VerifyOut(
         verified=True,
@@ -462,11 +491,13 @@ def _create_spare_parts_request(body: CreateRequestIn) -> CreateRequestOut:
     """§11 order flow with server-side controls (§11.2/§18/§21), zero-trust
     toward the voice agent. Check order: cheap/leak-free first, identity
     verification before anything that could reveal account state."""
-    # 1. Required fields for an order.
-    if not (body.contact_no and body.date_of_birth and body.item and body.quantity is not None):
+    # 1. Required fields for an order. Identity may come from the KN-number
+    #    (copied from verify_caller) OR the spoken name — the server re-resolves
+    #    either way, so a lost KN never blocks a legitimate order.
+    if not ((body.contact_no or body.name) and body.date_of_birth and body.item and body.quantity is not None):
         return CreateRequestOut(
             created=False, denied=True, reason_code="INVALID_REQUEST",
-            message="Für eine Bestellung werden Kundendatensatz, Geburtsdatum, "
+            message="Für eine Bestellung werden Name, Geburtsdatum, "
                     "Artikel und Menge benötigt.",
         )
 
@@ -490,30 +521,26 @@ def _create_spare_parts_request(body: CreateRequestIn) -> CreateRequestOut:
         )
 
     # 4. Identity verification against BC (never trust the LLM's claimed state).
+    #    Same resolution as /verify-caller: spoken name and/or KN-number, so a
+    #    lost KN between tool calls never blocks a legitimate order.
     try:
-        contact = get_contact_by_no(body.contact_no)
-    except BCConfigError as e:
-        raise HTTPException(status_code=500, detail=f"config: {e}") from e
-    except Exception as e:
-        # BC unreachable -> we cannot verify -> we cannot order safely (§18).
-        log.exception("get_contact_by_no failed")
-        raise HTTPException(status_code=502, detail=f"bc: {e}") from e
-
-    verified, matched = False, []
-    if contact:
-        verified, matched = match_identity_factors(
-            contact,
+        contact, matched = _resolve_and_verify(
+            name=body.name,
+            contact_no=body.contact_no,
             date_of_birth=body.date_of_birth,
             phone_number=body.phone_number,
             customer_number=body.customer_number,
             postal_code=body.postal_code,
-            phone_matches=phone_matches,
         )
-    # Factor NAMES only — never values (PII) and never surfaced to the caller.
-    log.info("create-request verify: contact_found=%s verified=%s factors=%s",
-             bool(contact), verified, matched)
-    if not (contact and verified):
-        # Identical response whether the contact is missing or a factor failed
+    except BCConfigError as e:
+        raise HTTPException(status_code=500, detail=f"config: {e}") from e
+    except Exception as e:
+        # BC unreachable -> we cannot verify -> we cannot order safely (§18).
+        log.exception("create-request identity resolution failed")
+        raise HTTPException(status_code=502, detail=f"bc: {e}") from e
+
+    if not contact:
+        # Identical response whether no record matched or a factor failed
         # (§10.1: never reveal which, never confirm a record exists).
         return CreateRequestOut(
             created=False, denied=True, reason_code="NOT_VERIFIED",
@@ -521,6 +548,7 @@ def _create_spare_parts_request(body: CreateRequestIn) -> CreateRequestOut:
                     "Bestellung ist so nicht möglich. Es kann ein Rückrufwunsch "
                     "erfasst werden.",
         )
+    verified = True  # by construction of _resolve_and_verify
 
     # 5. Eligibility re-check (90-day recency) on BC's customer number.
     #    Fail-open, flagged (signed off 2026-07-13): unknown -> human verifies.
